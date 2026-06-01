@@ -8,6 +8,10 @@
 #include <condition_variable>
 #include <atomic>
 
+#ifndef _WIN32
+#include <unistd.h>  // for pread()
+#endif
+
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -4381,6 +4385,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     }
+}
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
