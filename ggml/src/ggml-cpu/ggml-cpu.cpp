@@ -720,7 +720,7 @@ static void init_layer_buffer(void *& g_layer_buffer) {
         }
     }
 
-    g_layer_buffer_size = (size_t)(max_layer_bytes * 1.05);
+    g_layer_buffer_size = (size_t)(max_layer_bytes * 5);
 
     g_layer_buffer = malloc(g_layer_buffer_size);
     if (!g_layer_buffer) {

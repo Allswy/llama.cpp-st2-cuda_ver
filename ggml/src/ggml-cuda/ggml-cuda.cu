@@ -194,7 +194,7 @@ static size_t get_max_gpu_layer_size() {
             max_size = g_my_layer_table[i].total_bytes_needed;
         }
     }
-    return (size_t)(max_size * 1.05);  // 5% margin for 32-byte alignment padding
+    return (size_t)(max_size * 5);  // 5% margin for 32-byte alignment padding
 }
 
 // Allocate a single GPU ping-pong buffer
