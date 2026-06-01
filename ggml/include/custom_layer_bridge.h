@@ -8,7 +8,7 @@
 
 // 定义常量
 #define MAX_LAYERS 1005
-#define MAX_TENSORS_PER_LAYER 64
+#define MAX_TENSORS_PER_LAYER 512
 
 #ifdef __cplusplus
 extern "C" {
