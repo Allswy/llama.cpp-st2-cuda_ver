@@ -1,6 +1,12 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "custom_layer_bridge.h"
+
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -117,6 +123,30 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// ============================================================================
+// GPU Dynamic Layer Management Globals
+// ============================================================================
+static bool g_gpu_layer_mgmt_enabled = false;
+
+extern "C" {
+    void * g_gpu_layer_buffer_A = nullptr;
+    void * g_gpu_layer_buffer_B = nullptr;
+    void * g_gpu_io_ptr = nullptr;
+    void * g_gpu_compute_ptr = nullptr;
+    size_t g_gpu_layer_buffer_size = 0;
+}
+
+// GPU I/O Sync primitives (C++ only, static file scope)
+static std::thread * g_gpu_io_thread = nullptr;
+static std::mutex g_gpu_io_mutex;
+static std::condition_variable g_gpu_cv_worker;
+static std::condition_variable g_gpu_cv_main;
+static int g_gpu_prefetch_target = -999;
+static int g_gpu_prefetch_done   = -999;
+static std::atomic<bool> g_gpu_io_shutdown{false};
+static int g_gpu_currently_loaded = -999;
+static void * g_gpu_staging_buffer = nullptr;  // pinned CPU memory for disk→GPU transfer
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -145,6 +175,166 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
         err = cudaMalloc(ptr, size);
     }
     return err;
+}
+
+// ============================================================================
+// GPU Dynamic Layer Management: Helper Functions
+// ============================================================================
+
+// Compute the maximum single-layer size in bytes across all layers
+static size_t get_max_gpu_layer_size() {
+    size_t max_size = 0;
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        if (g_my_layer_table[i].is_initialized &&
+            g_my_layer_table[i].total_bytes_needed > max_size) {
+            max_size = g_my_layer_table[i].total_bytes_needed;
+        }
+    }
+    return (size_t)(max_size * 1.05);  // 5% margin for 32-byte alignment padding
+}
+
+// Allocate a single GPU ping-pong buffer
+static void init_gpu_layer_buffer(void *& buf, size_t size) {
+    if (buf != nullptr) return;
+    CUDA_CHECK(cudaMalloc(&buf, size));
+}
+
+// GPU I/O Worker thread: reads layer from disk to staging, uploads to GPU via cudaMemcpyAsync
+static void gpu_io_worker_func() {
+    // Allocate pinned staging buffer for fast PCIe transfer
+    cudaError_t err = cudaMallocHost(&g_gpu_staging_buffer, g_gpu_layer_buffer_size);
+    if (err != cudaSuccess) {
+        // Fall back to regular malloc if pinned memory fails
+        (void)cudaGetLastError();
+        g_gpu_staging_buffer = malloc(g_gpu_layer_buffer_size);
+    }
+
+    // Dedicated CUDA stream for async copy
+    cudaStream_t copy_stream;
+    CUDA_CHECK(cudaStreamCreate(&copy_stream));
+
+    while (!g_gpu_io_shutdown) {
+        std::unique_lock<std::mutex> lock(g_gpu_io_mutex);
+        g_gpu_cv_worker.wait(lock, []{
+            return g_gpu_prefetch_target != -999 || g_gpu_io_shutdown;
+        });
+        if (g_gpu_io_shutdown) break;
+
+        int target = g_gpu_prefetch_target;
+        lock.unlock();
+
+        // Load layer from disk into staging buffer, then upload to GPU
+        if (target >= 0 && target < MAX_LAYERS &&
+            g_my_layer_table[target].is_initialized) {
+
+            LayerDiskInfo * info = &g_my_layer_table[target];
+            size_t offset = 0;
+
+            for (int i = 0; i < info->tensor_count; i++) {
+                TensorLocation * loc = &info->tensors[i];
+                offset = (offset + 31) & ~31;  // 32-byte alignment
+
+                void * staging_addr = (char*)g_gpu_staging_buffer + offset;
+
+                // Read from disk to staging buffer
+#ifdef _WIN32
+                _fseeki64(g_model_file, loc->absolute_file_offset, SEEK_SET);
+                fread(staging_addr, 1, loc->n_bytes, g_model_file);
+#else
+                pread(fileno(g_model_file), staging_addr,
+                      loc->n_bytes, loc->absolute_file_offset);
+#endif
+                // Record GPU address for this tensor
+                loc->cached_gpu_addr = (char*)g_gpu_io_ptr + offset;
+                offset += loc->n_bytes;
+            }
+
+            // Async upload entire layer to GPU
+            CUDA_CHECK(cudaMemcpyAsync(g_gpu_io_ptr, g_gpu_staging_buffer,
+                           offset, cudaMemcpyHostToDevice, copy_stream));
+            CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        }
+
+        lock.lock();
+        if (g_gpu_prefetch_target == target) {
+            g_gpu_prefetch_target = -999;
+        }
+        g_gpu_prefetch_done = target;
+        g_gpu_cv_main.notify_all();
+    }
+
+    CUDA_CHECK(cudaStreamDestroy(copy_stream));
+}
+
+// Ensure the given layer is loaded into the GPU compute buffer.
+// Blocks if the layer is not yet loaded, swaps ping-pong buffers when ready.
+extern "C" void ensure_gpu_layer_loaded(int target_layer, int next_layer_hint) {
+    if (target_layer == -999) return;
+
+    {
+        std::unique_lock<std::mutex> lock(g_gpu_io_mutex);
+
+        if (g_gpu_currently_loaded != target_layer) {
+            // Issue urgent load command if worker isn't already handling this layer
+            if (g_gpu_prefetch_target != target_layer &&
+                g_gpu_prefetch_done   != target_layer) {
+                g_gpu_prefetch_target = target_layer;
+                g_gpu_prefetch_done   = -999;
+                g_gpu_cv_worker.notify_all();
+            }
+
+            // Block until worker finishes loading
+            g_gpu_cv_main.wait(lock, [&]{
+                return g_gpu_prefetch_done == target_layer;
+            });
+
+            // Swap buffers: newly loaded becomes compute buffer
+            std::swap(g_gpu_compute_ptr, g_gpu_io_ptr);
+            g_gpu_currently_loaded = target_layer;
+        }
+    }
+
+    // Prefetch hint: tell worker to load next layer while we compute current
+    if (next_layer_hint != -999) {
+        std::unique_lock<std::mutex> lock(g_gpu_io_mutex);
+        if (g_gpu_prefetch_target == -999 &&
+            g_gpu_prefetch_done   != next_layer_hint) {
+            g_gpu_prefetch_target = next_layer_hint;
+            g_gpu_prefetch_done   = -999;
+            g_gpu_cv_worker.notify_all();
+        }
+    }
+}
+
+// Look up a tensor's GPU device address within a loaded layer
+extern "C" void * get_gpu_tensor_memory_by_name(int target_layer,
+                                                  const char * tensor_name) {
+    LayerDiskInfo * info = &g_my_layer_table[target_layer];
+    for (int i = 0; i < info->tensor_count; i++) {
+        if (strcmp(info->tensors[i].name, tensor_name) == 0) {
+            return info->tensors[i].cached_gpu_addr;
+        }
+    }
+    return nullptr;
+}
+
+// Initialize the GPU layer management system (called lazily on first CUDA compute)
+extern "C" void start_gpu_async_prefetch_engine(void) {
+    static bool started = false;
+    if (started) return;
+    started = true;
+
+    g_gpu_layer_buffer_size = get_max_gpu_layer_size();
+    if (g_gpu_layer_buffer_size == 0) return;
+
+    init_gpu_layer_buffer(g_gpu_layer_buffer_A, g_gpu_layer_buffer_size);
+    init_gpu_layer_buffer(g_gpu_layer_buffer_B, g_gpu_layer_buffer_size);
+
+    g_gpu_compute_ptr = g_gpu_layer_buffer_A;
+    g_gpu_io_ptr      = g_gpu_layer_buffer_B;
+
+    g_gpu_io_thread = new std::thread(gpu_io_worker_func);
+    g_gpu_layer_mgmt_enabled = true;
 }
 
 #if defined(GGML_USE_HIP)
@@ -3678,6 +3868,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // ====== Dynamic GPU Layer Loading ======
+                if (g_gpu_layer_mgmt_enabled) {
+                    // 1. Determine target layer from tensor src names
+                    int target_layer = -999;
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (node->src[j] != NULL && node->src[j]->name[0] != '\0') {
+                            const char * t_name = node->src[j]->name;
+                            if (strncmp(t_name, "blk.", 4) == 0) {
+                                target_layer = atoi(t_name + 4); break;
+                            } else if (strcmp(t_name, "token_embd.weight") == 0) {
+                                target_layer = 998; break;
+                            } else if (strcmp(t_name, "output.weight") == 0) {
+                                target_layer = 999; break;
+                            } else if (strcmp(t_name, "output_norm.weight") == 0) {
+                                target_layer = 1000; break;
+                            }
+                        }
+                    }
+
+                    // 2. Ensure this layer is loaded into GPU buffer + prefetch next
+                    int next_layer = get_next_layer(target_layer);
+                    ensure_gpu_layer_loaded(target_layer, next_layer);
+
+                    // 3. Rebind src tensor data pointers → GPU device addresses
+                    if (target_layer != -999) {
+                        for (int j = 0; j < GGML_MAX_SRC; j++) {
+                            if (node->src[j] != NULL && node->src[j]->name[0] != '\0') {
+                                void * gpu_addr = get_gpu_tensor_memory_by_name(
+                                    target_layer, node->src[j]->name);
+                                if (gpu_addr != NULL) {
+                                    node->src[j]->data = gpu_addr;
+                                }
+                            }
+                        }
+                    }
+                }
+                // ====== End Dynamic GPU Layer Loading ======
+
                 // start of fusion operations
                 static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                 if (!disable_fusion) {
@@ -4022,7 +4250,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
-                        assert(node->src[j]->buffer);
+                        // Skip dynamic-layer weights: they have no buffer (intercepted in ggml_backend_tensor_alloc)
+                        if (node->src[j]->buffer == NULL) continue;
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
@@ -4102,6 +4331,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // Lazy initialization: on first graph compute with GGML_CUDA_DYNAMIC_LAYERS=1,
+    // allocate GPU ping-pong buffers and start the I/O worker thread.
+    if (getenv("GGML_CUDA_DYNAMIC_LAYERS") != nullptr && !g_gpu_layer_mgmt_enabled) {
+        start_gpu_async_prefetch_engine();
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4138,6 +4373,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+
+    // Dynamic layer loading is fundamentally incompatible with CUDA Graphs:
+    // CUDA Graph captures fixed kernel addresses, but dynamic loading rebinds
+    // tensor->data pointers on every node.
+    if (g_gpu_layer_mgmt_enabled) {
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
     }
 #endif // USE_CUDA_GRAPH
 

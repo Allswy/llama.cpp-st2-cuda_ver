@@ -21,7 +21,8 @@ extern "C" {
         uint64_t absolute_file_offset;
         uint64_t n_bytes;
 
-        void* cached_pool_addr;
+        void* cached_pool_addr;     // CPU buffer address (used by CPU backend)
+        void* cached_gpu_addr;      // GPU buffer address (used by CUDA backend)
     };
 
     struct LayerDiskInfo {
@@ -45,6 +46,13 @@ extern "C" {
 
 
 
+    // GPU buffer globals (defined in ggml-cuda.cu)
+    extern void * g_gpu_layer_buffer_A;
+    extern void * g_gpu_layer_buffer_B;
+    extern void * g_gpu_io_ptr;
+    extern void * g_gpu_compute_ptr;
+    extern size_t g_gpu_layer_buffer_size;
+
     // 声明函数原型
     void load_layer_from_disk(int target_layer);
     void init_layer_table(void);
@@ -52,6 +60,11 @@ extern "C" {
     void start_async_prefetch_engine(void);
     void ensure_layer_loaded(int target_layer, int next_layer_hint);
     int get_next_layer(int current_layer);
+
+    // GPU-side layer management (defined in ggml-cuda.cu)
+    void start_gpu_async_prefetch_engine(void);
+    void ensure_gpu_layer_loaded(int target_layer, int next_layer_hint);
+    void* get_gpu_tensor_memory_by_name(int target_layer, const char* tensor_name);
 
 
 #ifdef __cplusplus
