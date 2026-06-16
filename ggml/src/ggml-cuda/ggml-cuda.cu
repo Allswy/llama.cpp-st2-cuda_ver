@@ -194,13 +194,13 @@ static size_t get_max_gpu_layer_size() {
             max_size = g_my_layer_table[i].total_bytes_needed;
         }
     }
-    return (size_t)(max_size * 5);  // 5% margin for 32-byte alignment padding
+    return (size_t)(max_size * 1.05);  // 5% margin for 32-byte alignment padding
 }
 
 // Allocate a single GPU ping-pong buffer
-static void init_gpu_layer_buffer(void *& buf, size_t size) {
+static void init_gpu_layer_buffer(void *& buf, size_t size, int device) {
     if (buf != nullptr) return;
-    CUDA_CHECK(cudaMalloc(&buf, size));
+    CUDA_CHECK(ggml_cuda_device_malloc(&buf, size, device));
 }
 
 // GPU I/O Worker thread: reads layer from disk to staging, uploads to GPU via cudaMemcpyAsync
@@ -323,7 +323,7 @@ extern "C" void * get_gpu_tensor_memory_by_name(int target_layer,
 }
 
 // Initialize the GPU layer management system (called lazily on first CUDA compute)
-extern "C" void start_gpu_async_prefetch_engine(void) {
+extern "C" void start_gpu_async_prefetch_engine(int device) {
     static bool started = false;
     if (started) return;
     started = true;
@@ -331,8 +331,8 @@ extern "C" void start_gpu_async_prefetch_engine(void) {
     g_gpu_layer_buffer_size = get_max_gpu_layer_size();
     if (g_gpu_layer_buffer_size == 0) return;
 
-    init_gpu_layer_buffer(g_gpu_layer_buffer_A, g_gpu_layer_buffer_size);
-    init_gpu_layer_buffer(g_gpu_layer_buffer_B, g_gpu_layer_buffer_size);
+    init_gpu_layer_buffer(g_gpu_layer_buffer_A, g_gpu_layer_buffer_size, device);
+    init_gpu_layer_buffer(g_gpu_layer_buffer_B, g_gpu_layer_buffer_size, device);
 
     g_gpu_compute_ptr = g_gpu_layer_buffer_A;
     g_gpu_io_ptr      = g_gpu_layer_buffer_B;
@@ -4338,7 +4338,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // Lazy initialization: on first graph compute with GGML_CUDA_DYNAMIC_LAYERS=1,
     // allocate GPU ping-pong buffers and start the I/O worker thread.
     if (getenv("GGML_CUDA_DYNAMIC_LAYERS") != nullptr && !g_gpu_layer_mgmt_enabled) {
-        start_gpu_async_prefetch_engine();
+        start_gpu_async_prefetch_engine(cuda_ctx->device);
     }
 
     bool use_cuda_graph             = false;

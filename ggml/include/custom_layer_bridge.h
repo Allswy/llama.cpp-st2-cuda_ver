@@ -62,7 +62,7 @@ extern "C" {
     int get_next_layer(int current_layer);
 
     // GPU-side layer management (defined in ggml-cuda.cu)
-    void start_gpu_async_prefetch_engine(void);
+    void start_gpu_async_prefetch_engine(int device);
     void ensure_gpu_layer_loaded(int target_layer, int next_layer_hint);
     void* get_gpu_tensor_memory_by_name(int target_layer, const char* tensor_name);
 

@@ -573,6 +573,11 @@ llama_model_loader::llama_model_loader(
             }
         }
 
+        for (int i = 0; i < MAX_LAYERS; i++) {
+            g_my_layer_table[i].tensor_count = 0;
+            g_my_layer_table[i].is_initialized = false;
+        }
+
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
